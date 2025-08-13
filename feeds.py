@@ -1,82 +1,158 @@
 # feeds.py
+"""
+Feed fetchers for the Mini Threat-Intelligence Platform.
+
+- URLhaus (recent): tries CSV first, then falls back to the text feed.
+- Spamhaus: DROP, EDROP, and DROPv6 (CIDR lists).
+
+Each fetch_* function returns a list of normalized "indicator" dicts:
+{
+  "type": "url" | "ip" | "domain" | "cidr",
+  "value": "...",
+  "source": "urlhaus" | "spamhaus-drop" | "spamhaus-edrop" | "spamhaus-dropv6",
+  "first_seen": "YYYY-MM-DDTHH:MM:SSZ",
+  "last_seen":  "YYYY-MM-DDTHH:MM:SSZ",
+  "tags": "comma,separated",
+  "confidence": int (0-100),
+  "status": "active" | "inactive",
+}
+"""
+
+from datetime import datetime, timezone
 import csv
 import io
-import re
 import requests
-from datetime import datetime, timezone
 
-# --- URLhaus ---
-# We'll use the "recent CSV" which lists recent malicious URLs.
+# ---- URLhaus ----
+# CSV (recent) and plain-text (recent) endpoints
 URLHAUS_RECENT_CSV = "https://urlhaus.abuse.ch/downloads/csv_recent/"
+URLHAUS_RECENT_TXT = "https://urlhaus.abuse.ch/downloads/text_recent/"
 
-# --- Spamhaus ---
-# DROP (IPv4), EDROP (IPv4), and DROPv6 (IPv6) CIDR lists.
-SPAMHAUS_DROP = "https://www.spamhaus.org/drop/drop.txt"
-SPAMHAUS_EDROP = "https://www.spamhaus.org/drop/edrop.txt"
-SPAMHAUS_DROPV6 = "https://www.spamhaus.org/drop/dropv6.txt"
+# ---- Spamhaus ----
+SPAMHAUS_DROP   = "https://www.spamhaus.org/drop/drop.txt"     # IPv4 CIDRs
+SPAMHAUS_EDROP  = "https://www.spamhaus.org/drop/edrop.txt"    # IPv4 (extended) CIDRs
+SPAMHAUS_DROPV6 = "https://www.spamhaus.org/drop/dropv6.txt"   # IPv6 CIDRs
 
 REQUEST_TIMEOUT = 25  # seconds
+UA = "mini-tip/0.1 (+https://github.com/alexv199/mini-tip; educational)"  # change if you like
 
-def _utc_now_iso():
+
+def _utc_now_iso() -> str:
+    """UTC timestamp in ISO 8601 with 'Z' suffix."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def fetch_urlhaus_recent():
-    """
-    Downloads the recent CSV and yields normalized indicator dicts for 'url'.
-    CSV has many '#' commented lines at the top. We skip them.
-    """
-    resp = requests.get(URLHAUS_RECENT_CSV, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
 
-    # The CSV contains a header after the comment block.
-    # We'll find the first non-comment line to feed into csv.DictReader.
-    text = resp.text
-    # Remove the leading commented lines:
-    lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
-    if not lines:
+# -----------------------------
+# URLhaus helpers / main fetcher
+# -----------------------------
+def _parse_urlhaus_csv(text: str) -> list[dict]:
+    """
+    Parse URLhaus CSV content.
+    Skips comment lines beginning with '#', normalizes headers to lowercase.
+    """
+    # Keep only non-comment lines; header appears after the banner comments.
+    rows = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if not rows:
         return []
 
-    csv_text = "\n".join(lines)
-    reader = csv.DictReader(io.StringIO(csv_text))
-    indicators = []
+    reader = csv.DictReader(io.StringIO("\n".join(rows)))
+    out: list[dict] = []
+
     for row in reader:
-        # Common fields: dateadded,url,threat,host,url_status,rtir_id,tags,...
-        url = row.get("url") or row.get("URL") or ""
+        # Some columns may vary in case; normalize keys
+        low = { (k or "").strip().lower(): (v or "").strip() for k, v in row.items() }
+
+        url = low.get("url") or ""
         if not url:
             continue
-        dateadded = row.get("dateadded") or _utc_now_iso()
-        tags = row.get("tags", "")
-        status = "active" if (row.get("url_status","").lower() != "offline") else "inactive"
 
-        indicators.append({
+        dateadded = low.get("dateadded") or low.get("firstseen") or _utc_now_iso()
+        status_field = (low.get("url_status") or low.get("status") or "").lower()
+        status = "inactive" if status_field == "offline" else "active"
+
+        out.append({
             "type": "url",
-            "value": url.strip(),
+            "value": url,
             "source": "urlhaus",
             "first_seen": dateadded,
             "last_seen": dateadded,
-            "tags": tags,
-            "confidence": 80,  # arbitrary default higher than 50
-            "status": status
+            "tags": low.get("tags", ""),
+            "confidence": 80,
+            "status": status,
         })
-    return indicators
+    return out
 
-def _parse_spamhaus_text(text: str, source_name: str):
+
+def _parse_urlhaus_text(text: str) -> list[dict]:
     """
-    Parses Spamhaus DROP style lists.
-    Lines look like:
-      203.0.113.0/24 ; SBL123456 Example
+    Parse URLhaus text feed: one URL per line, '#' lines are comments.
+    """
+    out: list[dict] = []
+    now = _utc_now_iso()
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("http://") or s.startswith("https://"):
+            out.append({
+                "type": "url",
+                "value": s,
+                "source": "urlhaus",
+                "first_seen": now,
+                "last_seen": now,
+                "tags": "",
+                "confidence": 80,
+                "status": "active",
+            })
+    return out
+
+
+def fetch_urlhaus_recent() -> list[dict]:
+    """
+    Try URLhaus CSV first; if we parse 0 rows, fall back to the text feed.
+    Raises for HTTP errors; returns [] if no indicators parsed.
+    """
+    headers = {
+        "User-Agent": UA,
+        "Accept": "text/csv, text/plain;q=0.9, */*;q=0.8",
+    }
+
+    # Attempt CSV
+    r = requests.get(URLHAUS_RECENT_CSV, headers=headers, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+
+    # If a block page (HTML) ever appears, bail clearly rather than silently returning 0.
+    first = r.text.lstrip().lower()
+    if first.startswith("<!doctype") or first.startswith("<html"):
+        raise RuntimeError("URLhaus returned HTML (possible block page).")
+
+    indicators = _parse_urlhaus_csv(r.text)
+    if indicators:
+        return indicators
+
+    # Fallback: plain-text feed
+    r2 = requests.get(URLHAUS_RECENT_TXT, headers=headers, timeout=REQUEST_TIMEOUT)
+    r2.raise_for_status()
+    return _parse_urlhaus_text(r2.text)
+
+
+# -----------------------------
+# Spamhaus helpers / main fetch
+# -----------------------------
+def _parse_spamhaus_text(text: str, source_name: str) -> list[dict]:
+    """
+    Parse Spamhaus DROP/EDROP/DROPv6 lists.
+    Lines look like: "203.0.113.0/24 ; SBL123456 Description"
     Lines starting with ';' are comments.
-    We return 'cidr' indicators.
     """
-    indicators = []
+    indicators: list[dict] = []
     now = _utc_now_iso()
     for raw in text.splitlines():
         raw = raw.strip()
         if not raw or raw.startswith(";"):
             continue
-        # The CIDR is the first token on the line
+        # First token on the line is the CIDR
         cidr = raw.split()[0]
-        # Basic validation: CIDR pattern (IPv4 or IPv6)
         if "/" not in cidr:
             continue
         indicators.append({
@@ -87,22 +163,25 @@ def _parse_spamhaus_text(text: str, source_name: str):
             "last_seen": now,
             "tags": "drop-list",
             "confidence": 70,
-            "status": "active"
+            "status": "active",
         })
     return indicators
 
-def fetch_spamhaus_all():
+
+def fetch_spamhaus_all() -> list[dict]:
     """
-    Fetches DROP, EDROP, and DROPv6.
-    Note: Spamhaus terms restrict redistribution; personal research use is OK.
+    Fetch Spamhaus DROP, EDROP, and DROPv6 lists and return CIDR indicators.
     """
-    indicators = []
+    headers = {"User-Agent": UA, "Accept": "text/plain"}
+    indicators: list[dict] = []
+
     for url, name in [
-        (SPAMHAUS_DROP, "spamhaus-drop"),
-        (SPAMHAUS_EDROP, "spamhaus-edrop"),
+        (SPAMHAUS_DROP,   "spamhaus-drop"),
+        (SPAMHAUS_EDROP,  "spamhaus-edrop"),
         (SPAMHAUS_DROPV6, "spamhaus-dropv6"),
     ]:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         indicators.extend(_parse_spamhaus_text(resp.text, name))
+
     return indicators
