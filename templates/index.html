@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Mini Threat-Intel Platform</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body>
+  <header>
+    <h1>Mini Threat-Intelligence Platform</h1>
+    <p class="muted">Python • Flask • SQLite • APScheduler • URLhaus • Spamhaus</p>
+  </header>
+
+  <section class="stats">
+    <div class="stat"><strong>Total</strong><span id="total">{{ total }}</span></div>
+    <div class="stat"><strong>URLhaus (URLs)</strong><span>{{ total_urlhaus }}</span></div>
+    <div class="stat"><strong>Spamhaus (CIDRs)</strong><span>{{ total_spamhaus }}</span></div>
+    <div class="stat"><strong>URLs</strong><span>{{ total_urls }}</span></div>
+    <div class="stat"><strong>CIDRs</strong><span>{{ total_cidrs }}</span></div>
+  </section>
+
+  <section class="controls">
+    <input id="q" placeholder="Search value (e.g., example.com or 203.0.113.0)" />
+    <select id="type">
+      <option value="">Any type</option>
+      <option>url</option>
+      <option>domain</option>
+      <option>ip</option>
+      <option>cidr</option>
+    </select>
+    <select id="source">
+      <option value="">Any source</option>
+      <option>urlhaus</option>
+      <option>spamhaus-drop</option>
+      <option>spamhaus-edrop</option>
+      <option>spamhaus-dropv6</option>
+    </select>
+    <button id="searchBtn">Search</button>
+    <button id="refreshBtn" title="Fetch feeds now">Fetch feeds</button>
+  </section>
+
+  <section>
+    <table id="results">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Value</th>
+          <th>Source</th>
+          <th>First Seen</th>
+          <th>Last Seen</th>
+          <th>Tags</th>
+          <th>Confidence</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p class="muted">For learning only. Don’t click suspicious links. Respect feed terms.</p>
+  </footer>
+
+  <script>
+    async function search() {
+      const q = document.getElementById('q').value;
+      const type = document.getElementById('type').value;
+      const source = document.getElementById('source').value;
+
+      const params = new URLSearchParams();
+      if (q) params.set('q', q);
+      if (type) params.set('type', type);
+      if (source) params.set('source', source);
+
+      const resp = await fetch('/indicators?' + params.toString());
+      const data = await resp.json();
+      const tbody = document.querySelector('#results tbody');
+      tbody.innerHTML = '';
+      for (const row of data) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row.type}</td>
+          <td class="mono">${row.value}</td>
+          <td>${row.source}</td>
+          <td>${row.first_seen ?? ''}</td>
+          <td>${row.last_seen ?? ''}</td>
+          <td>${row.tags ?? ''}</td>
+          <td>${row.confidence ?? ''}</td>
+          <td>${row.status ?? ''}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function refreshFeeds() {
+      const btn = document.getElementById('refreshBtn');
+      btn.disabled = true;
+      btn.textContent = 'Fetching...';
+      try {
+        const resp = await fetch('/feeds/run', { method: 'POST' });
+        await resp.json();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Fetch feeds';
+        search(); // refresh table
+      }
+    }
+
+    document.getElementById('searchBtn').addEventListener('click', search);
+    document.getElementById('refreshBtn').addEventListener('click', refreshFeeds);
+
+    // Load initial results
+    search();
+  </script>
+</body>
+</html>
